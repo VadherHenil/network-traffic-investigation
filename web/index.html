@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HENIX · Network investigation</title>
+  <link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script>
+</head>
+<body>
+<aside class="rail">
+  <div class="brand"><i class="brandmark" aria-hidden="true"><b></b><b></b><b></b><b></b></i>HENIX</div>
+  <div class="rail-label">Investigation</div>
+  <nav aria-label="Investigation views">
+    <button data-page="overview" class="active"><span aria-hidden="true">▦</span> Overview</button>
+    <button data-page="packets"><span aria-hidden="true">≡</span> Packet explorer</button>
+    <button data-page="ai"><span aria-hidden="true">✧</span> AI review</button>
+    <button data-page="report"><span aria-hidden="true">▤</span> Report</button>
+  </nav>
+  <div class="rail-label file-label">Open captures</div><div id="files"></div>
+  <button class="rail-import" id="sideImport">＋ Import capture</button>
+  <div class="engine"><i id="engineDot"></i><div><b>Local workspace</b><small id="engineName">Starting decoder…</small></div></div>
+</aside>
+<main>
+  <header class="top"><div class="crumb">Workspace <span>/</span> <b id="crumb">Investigation</b></div><div class="top-tools"><button id="themeMode" type="button" class="secondary" aria-pressed="false" aria-label="Dark mode">☾ Dark mode</button><button id="import" class="primary"><strong aria-hidden="true">↑</strong> Import capture</button></div></header>
+  <div id="notice" role="alert" hidden></div>
+  <section id="importState" class="import-state panel" aria-label="Capture import progress" hidden>
+    <div class="import-info"><strong id="importStage"></strong><span id="importStatus" role="status"></span><progress id="importMeter" aria-label="Capture import progress"></progress></div>
+    <button id="importAction" type="button" class="secondary" hidden></button>
+  </section>
+  <section class="pagehead"><div><h1 id="title">Capture overview</h1><div id="identity"></div></div><button id="fileInfo" class="secondary" hidden>Evidence details</button></section>
+  <section id="empty" class="panel empty"><div class="empty-icon" aria-hidden="true">↑</div><h2>Open a capture to investigate</h2><p>Drop a .cap, .pcap or .pcapng file here to inspect its traffic locally.</p><button id="emptyImport" class="primary">Choose capture</button><p class="import-limits">Up to 5 GiB per file</p></section>
+  <div id="work" hidden>
+    <form id="filterForm" class="filterbar"><label for="filter">Display filter</label><input id="filter" spellcheck="false" autocomplete="off" maxlength="2048" placeholder="e.g. tcp.stream == 0"><button type="submit" class="dark">Apply</button><button type="button" id="clear" class="secondary">Clear</button></form>
+    <div class="filter-tools"><div class="presets" id="presets" aria-label="Quick filters"></div><select id="presetList" aria-label="More display filters"><option value="">More filters…</option></select></div>
+    <section id="overview" class="view">
+      <div class="kpis" id="kpis"></div>
+      <div class="charts">
+        <article class="panel"><div class="panelhead"><div><h2>Traffic activity</h2><p>Packet arrivals across the selected window</p></div><span class="legend"><i></i>Packets</span></div>
+          <div id="plot" role="img" aria-label="Packet arrivals by time interval"></div><div class="axis"><span id="axisStart"></span><span id="axisEnd"></span></div></article>
+        <article class="panel"><div class="panelhead"><div><h2>Detected protocols</h2><p id="protocolCount"></p></div></div><div id="protocols"></div><details><summary>Protocol hierarchy</summary><pre id="hierarchy"></pre></details></article>
+      </div>
+      <article class="panel"><div class="panelhead"><div><h2>Investigation findings</h2><p>Selected exchanges with packet references</p></div><button class="textbtn" id="goReport">View report →</button></div><div id="findings"></div></article>
+      <article class="panel"><div class="panelhead"><div><h2>TCP conversations</h2><p id="streamCount"></p></div></div><div id="streams"></div></article>
+    </section>
+    <section id="packets" class="view" hidden>
+      <article class="panel"><div class="panelhead"><div><h2>Matching packets</h2><p id="packetCount"></p></div></div>
+      <div class="tablewrap"><table class="packet-table"><thead><tr><th>Frame</th><th>Time (UTC)</th><th>Source</th><th>Src port</th><th>Destination</th><th>Dst port</th><th>Protocol</th><th>Bytes</th><th>Information</th></tr></thead><tbody id="packetBody"></tbody></table></div>
+      <form id="pager" class="pager"><button type="button" id="prev" class="secondary">Previous</button><label for="pageNumber">Page</label><input type="number" id="pageNumber" min="1" step="1" required><span id="pageLabel"></span><button class="secondary" type="submit">Go</button><button type="button" id="next" class="secondary">Next</button></form></article>
+    </section>
+    <section id="ai" class="view" hidden>
+      <article class="panel"><div class="panelhead"><div><h2>Review with an AI provider</h2><p>Review the evidence excerpt before sending it with your API key.</p></div></div>
+      <form id="aiForm"><div class="formgrid"><label>Provider<select id="provider" required></select></label>
+        <label>Model ID<input id="model" maxlength="200" placeholder="Model ID from your provider" required></label></div>
+      <div id="customSettings" hidden><label>Full API endpoint<input id="apiEndpoint" type="url" autocomplete="off" maxlength="2048" placeholder="https://your-provider.example/v1/chat/completions"></label>
+        <div class="formgrid"><label>API format<select id="apiProtocol"><option value="chat">Chat Completions</option><option value="responses">OpenAI Responses</option><option value="messages">Anthropic Messages</option><option value="gemini">Gemini generateContent</option></select></label>
+        <label>API key header<select id="apiAuth"><option value="auto">Default for API format</option><option value="bearer">Authorization: Bearer</option><option>api-key</option><option>x-api-key</option><option>x-goog-api-key</option></select></label></div>
+        <p class="muted">Your key and evidence excerpt go to this URL. For generateContent, include {model} in the endpoint path.</p></div>
+      <div class="formgrid"><label>API key<input type="password" id="key" autocomplete="off" required></label></div>
+      <details id="excerpt"><summary>Evidence sent to the provider</summary><pre id="preview"></pre></details>
+      <p class="muted">Includes up to 40 matching frames with timestamps, endpoints and selected protocol fields. Your key is used for this request only.</p>
+      <button class="primary" id="sendReview">Send excerpt for review</button></form></article>
+      <article class="panel" id="aiResult" hidden></article>
+    </section>
+    <section id="report" class="view" hidden>
+      <article class="panel reportcard"><div><h2>Investigation report</h2><p>Export a print-ready report or a casefile with the evidence manifest, timeline and display filters.</p></div>
+        <div class="actions"><button id="exportHTML" class="primary">Download HTML</button><button id="exportZip" class="secondary">Export casefile .zip</button></div></article>
+      <article class="panel"><div class="panelhead"><div><h2>Report evidence</h2><p id="reportScope"></p></div></div><div id="reportFindings"></div>
+      <h3 class="subhead">Observed flow</h3><div id="reportTimeline"></div><p id="reportAi" class="muted"></p></article>
+    </section>
+  </div>
+</main>
+<dialog id="importDialog" aria-labelledby="importTitle"><form id="importForm"><div class="dialoghead"><h2 id="importTitle">Import capture</h2><button type="button" class="dismiss" aria-label="Close">×</button></div>
+  <label id="drop" for="upload"><strong id="fileName">Choose a capture or drop it here</strong><span>.cap · .pcap · .pcapng &nbsp; / &nbsp; Up to 5 GiB</span></label>
+  <input id="upload" type="file" accept=".cap,.pcap,.pcapng">
+  <label>Evidence source <small>(optional)</small><input id="source" placeholder="Source URL or collection notes" maxlength="2000"></label>
+  <label>Acquisition date <small>(optional)</small><input id="acquired" type="date"></label>
+  <p class="muted">HENIX stores a working copy and packet index on the local workspace drive. Keep the server running while it indexes the capture.</p>
+  <p id="importError" class="error" role="alert"></p><button class="primary" type="submit">Open capture</button></form></dialog>
+<dialog id="detailDialog" aria-labelledby="detailTitle"><div class="dialoghead"><h2 id="detailTitle">Frame details</h2><button class="dismiss" aria-label="Close">×</button></div><div id="detail"></div><p id="detailError" class="error" role="alert"></p></dialog>
+<div id="busy" role="status" hidden></div>
+</body></html>
