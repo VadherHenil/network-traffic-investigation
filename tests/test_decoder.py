@@ -38,6 +38,7 @@ class FrameInspectionTests(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        cls.capture.close()
         cls.folder.cleanup()
 
     def test_non_ip_and_truncated_capture(self):

@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from collections import deque
 from contextlib import closing, contextmanager
 from datetime import datetime, timezone
@@ -13,6 +14,7 @@ from threading import Event, RLock, Thread
 from time import monotonic
 
 from packet_index import FrameLookup, FrameView, PacketIndex
+from operations import ByteCache
 
 ROOT = Path(__file__).resolve().parent
 MAX_BYTES = 5 * 1024**3
@@ -223,30 +225,53 @@ def index_values(output, count):
 
 
 class Capture:
-    def __init__(self, path, name, digest, source="", acquired="", progress=None, stopping=None):
+    def _init_metadata(self, path, name, digest, source, acquired, stopping):
         self.path, self.name, self.digest = path, name, digest
         self.id = "EV-" + digest[:12].upper()
         self.source, self.acquired = source, acquired
+        self.acquisitions = []
+        self.record_acquisition(name, source, acquired)
         self.size = path.stat().st_size
         if self.size > MAX_BYTES:
             raise ValueError("Capture files are limited to 5 GiB.")
         self.dissection_passes = 1 if self.size > TWO_PASS_IMPORT_BYTES else 2
         self.args = ["-n", "-o", COLUMNS, "-r", str(path)]
+        self.stopping = stopping
+
+    def record_acquisition(self, name, source, acquired):
+        self.acquisitions.append(dict(name=name, source=source, acquired=acquired,
+                                      imported_at=datetime.now(timezone.utc).isoformat()))
+
+    @classmethod
+    def from_saved_index(cls, path, digest, acquisitions, index, stopping=None):
+        instance = cls.__new__(cls)
+        first = acquisitions[0]
+        instance._init_metadata(path, first["name"], digest, first["source"], first["acquired"], stopping)
+        instance.acquisitions = acquisitions
+        instance.index = index
+        instance.rows = FrameView(index, index.count)
+        instance.by_number = FrameLookup(instance.rows)
+        instance.window = instance.time_window(instance.rows)
+        instance._init_runtime()
+        return instance
+
+    def __init__(self, path, name, digest, source="", acquired="", progress=None, stopping=None):
+        self._init_metadata(path, name, digest, source, acquired, stopping)
         decode = self.args if self.dissection_passes == 1 else [*self.args, "-2"]
         fields = [item for field in FIELDS for item in ("-e", field)]
-        self.stopping = stopping
         self.index = PacketIndex(path.parent, stopping)
         count = [0]
 
         def heartbeat():
             self.check_open()
+            self.index.disk.check()
             if progress:
                 progress(count[0])
 
         try:
             self.check_open()
             args = [*decode, "-T", "fields", "-E", "escape=y", "-E", "quote=n", *fields]
-            with output_stream(args, heartbeat if progress or stopping is not None else None) as output:
+            with output_stream(args, heartbeat) as output:
                 self.rows = self.index.build(FIELDS, index_values(output, count))
             heartbeat()
             self.by_number = FrameLookup(self.rows)
@@ -254,8 +279,12 @@ class Capture:
         except BaseException:
             self.index.close()
             raise
+        self._init_runtime()
+
+    def _init_runtime(self):
         self.lock = RLock()
-        self.last_filter, self.last_rows = "", self.rows
+        self.filter_cache = ByteCache(128 * 1024**2, 12)
+        self.frame_cache = ByteCache(16 * 1024**2, 64)
 
     @staticmethod
     def time_window(rows):
@@ -277,7 +306,7 @@ class Capture:
     def manifest(self):
         return dict(id=self.id, name=self.name, sha256=self.digest, size=self.size,
                     total=len(self.rows), window=self.window, source=self.source, acquired=self.acquired,
-                    dissection_passes=self.dissection_passes)
+                    dissection_passes=self.dissection_passes, acquisitions=list(self.acquisitions))
 
     def select(self, expression):
         with self.lock:
@@ -286,7 +315,8 @@ class Capture:
                 return self.rows
             if len(expression) > 2048 or "\0" in expression:
                 raise ValueError("Use a display filter of up to 2,048 characters.")
-            if expression != self.last_filter:
+            rows = self.filter_cache.get(expression)
+            if rows is None:
                 # All arbitrary filters use two passes so forward references resolve.
                 exact = re.fullmatch(r"frame\.number\s*==\s*([1-9][0-9]{0,8}|0)", expression.strip())
                 if exact:
@@ -294,14 +324,19 @@ class Capture:
                     rows = self.index.select([n] if 1 <= n <= self.index.count else [])
                 else:
                     args = [*self.args, "-2", "-Y", expression, "-T", "fields", "-e", "frame.number"]
+
+                    def heartbeat():
+                        self.check_open()
+                        self.index.disk.check()
+
                     def numbers():
-                        with output_stream(args, self.check_open if self.stopping is not None else None) as output:
+                        with output_stream(args, heartbeat) as output:
                             for number in output:
                                 yield int(number)
                     with closing(numbers()) as matches:
                         rows = self.index.select(matches)
-                self.last_filter, self.last_rows = expression, rows
-            return self.last_rows
+                self.filter_cache.put(expression, rows, rows.matches.stat().st_size)
+            return rows
 
     def close(self):
         """Release the derivative index. The workspace owns the capture file."""
@@ -325,6 +360,10 @@ class Capture:
 
     def inspect_frame(self, number):
         number = str(number)
+        self.check_open()
+        cached = self.frame_cache.get(number)
+        if cached is not None:
+            return cached
         if not number.isascii() or not number.isdecimal() or number not in self.by_number:
             raise ValueError("Frame is outside this capture.")
         row = self.by_number[number]
@@ -345,10 +384,14 @@ class Capture:
             data_format += " · HTTP Content-Type " + fields["http.content_type"]
         chosen = next((key for key in PAYLOAD_FIELDS if key in fields), None)
         payload = bytes.fromhex(fields[chosen].replace(":", "")) if chosen else b""
-        return dict(detail=tree.rstrip(), hex=dump, layers=protocol_layers(row), src_port=port(row, "src"),
+        result = dict(detail=tree.rstrip(), hex=dump, layers=protocol_layers(row), src_port=port(row, "src"),
                     dst_port=port(row, "dst"), format=data_format, visibility=payload_visibility(row, fields),
                     captured=int(row["frame.cap_len"]), wire=int(row["frame.len"]), payload_field=chosen,
                     payload=hex_ascii(payload), payload_size=len(payload))
+        weight = sys.getsizeof(result) + sum(sys.getsizeof(v) for v in result.values())
+        weight += sum(sys.getsizeof(layer) for layer in result["layers"])
+        self.frame_cache.put(number, result, weight)
+        return result
 
 
 def metrics(rows):

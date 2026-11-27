@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 
 from app import MAX_BYTES, Handler, Workspace, WorkspaceServer
+from capture import version
 from tests.fixtures import checksum, training_capture
 
 
@@ -81,6 +82,7 @@ def verify(port, size, record_size):
         job = post("import-status", {"job": job["job"]})
     assert job["state"] == "ready", job
     evidence = job["capture"]
+    index_seconds = time.monotonic() - start
     assert (evidence["size"], evidence["total"], evidence["sha256"]) == (size, expected, digest.hexdigest())
     print(f"Verified SHA-256 and {expected:,} indexed frames in {time.monotonic() - start:.1f}s.", flush=True)
     scope = {"id": evidence["id"]}
@@ -92,7 +94,9 @@ def verify(port, size, record_size):
     print("Verified final page, full overview and packet findings.", flush=True)
     selected = post("packets", scope | {"filter": "udp.dstport == 62346", "page": (expected-13) // 50})
     assert selected["matched"] == expected-12 and selected["packets"][-1]["frame"] == str(expected)
+    frame_start = time.monotonic()
     decoded = post("frame", scope | {"frame": str(expected)})
+    frame_seconds = time.monotonic() - frame_start
     assert decoded["dst_port"] == "62346" and decoded["captured"] == decoded["wire"]
     assert post("preview", scope)["included_frames"] == 40
     assert evidence["sha256"].encode() in post("report", scope | {"format": "html"})
@@ -100,6 +104,50 @@ def verify(port, size, record_size):
     assert post("close", scope)["closed"]
     print(f"Verified filtering, last-frame dissection, AI preview, HTML/ZIP exports and close in "
           f"{time.monotonic() - start:.1f}s total.", flush=True)
+    return dict(capture_bytes=size, frames=expected, record_bytes=record_size,
+                upload_and_index_seconds=round(index_seconds, 3), late_frame_seconds=round(frame_seconds, 3),
+                elapsed_seconds=round(time.monotonic() - start, 3))
+
+
+class ResourceSampler:
+    """Sample the server process, its decoder children and visible workspace files."""
+
+    def __init__(self, folder):
+        import psutil  # Optional benchmark dependency. HENIX itself uses the standard library.
+        self.psutil = psutil
+        self.process = psutil.Process()
+        self.folder = Path(folder)
+        self.peaks = dict(python_rss_bytes=0, tshark_rss_bytes=0, combined_rss_bytes=0, workspace_bytes=0)
+        self.done = threading.Event()
+        self.thread = threading.Thread(target=self.sample)
+        self.error = None
+
+    def sample(self):
+        try:
+            while True:
+                python = self.process.memory_info().rss
+                decoders = 0
+                for child in self.process.children(recursive=True):
+                    try:
+                        if child.name().lower() in ("tshark", "tshark.exe"):
+                            decoders += child.memory_info().rss
+                    except self.psutil.NoSuchProcess:
+                        continue
+                disk = 0
+                for path in self.folder.rglob("*"):
+                    try:
+                        if path.is_file():
+                            disk += path.stat().st_size
+                    except FileNotFoundError:
+                        continue
+                sample = dict(python_rss_bytes=python, tshark_rss_bytes=decoders,
+                              combined_rss_bytes=python + decoders, workspace_bytes=disk)
+                for key, value in sample.items():
+                    self.peaks[key] = max(self.peaks[key], value)
+                if self.done.wait(0.25):
+                    break
+        except Exception as error:
+            self.error = error
 
 
 if __name__ == "__main__":
@@ -107,6 +155,7 @@ if __name__ == "__main__":
     parser.add_argument("--gib", type=float, required=True)
     parser.add_argument("--record-size", type=int, default=8192, help="PCAP record bytes, including 16-byte record header.")
     parser.add_argument("--work-dir", type=Path, help="Existing drive/directory with room for the working capture and index.")
+    parser.add_argument("--metrics", type=Path, help="Write a JSON benchmark result (requires psutil).")
     args = parser.parse_args()
     size = int(args.gib * 1024**3)
     if not 1024**2 <= size <= MAX_BYTES or not 64 <= args.record_size <= 65480:
@@ -116,10 +165,23 @@ if __name__ == "__main__":
             server.workspace = Workspace(folder)
             thread = threading.Thread(target=server.serve_forever)
             thread.start()
+            sampler = None
             try:
-                verify(server.server_port, size, args.record_size)
+                if args.metrics:
+                    sampler = ResourceSampler(folder)
+                    sampler.thread.start()
+                result = verify(server.server_port, size, args.record_size)
                 assert not list(Path(folder).iterdir()), "Closing the capture left working files."
             finally:
+                if sampler:
+                    sampler.done.set()
+                    sampler.thread.join()
                 server.shutdown()
                 thread.join()
-                server.workspace.shutdown()
+            if sampler:
+                if sampler.error:
+                    raise RuntimeError("Could not collect benchmark measurements") from sampler.error
+                result.update(decoder=version(), sample_interval_seconds=0.25, sampled_peaks=sampler.peaks)
+                args.metrics.parent.mkdir(parents=True, exist_ok=True)
+                args.metrics.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+                print(json.dumps(result, indent=2))

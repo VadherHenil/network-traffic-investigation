@@ -22,6 +22,24 @@ const captureLimit = 5 * 1024 ** 3;
 let importing = false;
 
 async function request(path, data={}, binary=false) {
+  const cancellable = busy && ["view","frame","packets","report","conversations"].includes(path);
+  let running = cancellable, storageTimer;
+  if (cancellable) {
+    const operation = crypto.randomUUID();
+    data = {...data, operation};
+    $("cancelOperation").hidden = false;
+    $("cancelOperation").onclick = () => request("cancel",{operation}).catch(err => notice(err.message));
+    async function updateStorage() {
+      try {
+        const snapshot = await request("storage");
+        if (running) $("busyStorage").textContent = storageSummary(snapshot);
+      } catch {
+        if (running) $("busyStorage").textContent = "Disk usage unavailable.";
+      }
+      if (running) storageTimer = setTimeout(updateStorage, 2000);
+    }
+    storageTimer = setTimeout(updateStorage, 1000);
+  }
   const headers = {"X-HENIX":"workspace", "Content-Type":"application/json"};
   try {
     const response = await fetch("/api/" + path, {method:"POST", headers, body:JSON.stringify(data)});
@@ -45,6 +63,13 @@ async function request(path, data={}, binary=false) {
     if (err instanceof TypeError) throw new Error("Cannot reach HENIX. Check that the local server is running, then reload the workspace.");
     if (err instanceof SyntaxError) throw new Error("HENIX returned an unreadable response. Reload the workspace and retry.");
     throw err;
+  } finally {
+    if (cancellable) {
+      running = false;
+      clearTimeout(storageTimer);
+      $("cancelOperation").hidden = true;
+      $("busyStorage").textContent = "";
+    }
   }
 }
 function scope(extra={}) { return {id:active, filter:expression, ...extra}; }
@@ -55,7 +80,7 @@ function notice(message="") {
 async function task(label, fn) {
   if (busy) return;
   busy = true;
-  $("busy").textContent = label;
+  $("busyMessage").textContent = label;
   $("busy").hidden = false;
   document.querySelector("main").setAttribute("inert", "");
   document.querySelector(".rail").setAttribute("inert", "");
@@ -89,6 +114,11 @@ function size(bytes) {
   if (bytes >= 1024 ** 3) return (bytes/1024 ** 3).toFixed(2) + " GiB";
   return (bytes/1048576).toFixed(1) + " MiB";
 }
+function storageSummary(storage) {
+  if (!storage) return "";
+  return size(storage.free_bytes) + " workspace free · " + size(storage.index_bytes) + " in indexes · " +
+    size(storage.filter_bytes) + " in filter files · " + size(storage.temp_free_bytes) + " temporary drive free";
+}
 function drawFiles() {
   $("files").innerHTML = files.map(c => '<button class="file ' + (c.id === active ? "current" : "") +
     '" data-id="' + esc(c.id) + '" title="' + esc(c.name) + '">' + esc(c.name) + '</button>').join("");
@@ -115,13 +145,14 @@ async function loadView(id, filter) {
   $("empty").hidden = true;
   $("fileInfo").hidden = false;
   $("excerpt").open = false;
-  $("preview").textContent = "";
+  clearReviewPreview();
   $("crumb").textContent = view.capture.name;
   $("identity").textContent = view.capture.name + "  ·  " + id;
   if ($("importState").dataset.readyId === id) $("importState").hidden = true;
   document.querySelectorAll("[data-page]").forEach(button => button.disabled = false);
   drawFiles();
   drawOverview();
+  resetConversationSearch();
   drawPackets(view);
   drawReport();
   drawAI();
@@ -138,7 +169,8 @@ function findings(full) {
   return view.findings.map(f => '<div class="finding"><h3>' + esc(f.title) + '</h3><div><p>' + esc(f.observation) +
     '</p>' + (full ? '<p class="muted">' + esc(f.meaning) + '</p>' : '') +
     '<div class="refs">' + f.frames.map(n => '<button class="ref" data-frame="' + esc(n) + '">#' + esc(n) +
-    '</button>').join("") + '</div></div></div>').join("");
+    '</button>').join("") + ' <button class="secondary" data-pin="' + esc(f.frames.join(",")) +
+    '" data-pin-note="' + esc(f.observation) + '">Pin exchange</button></div></div></div>').join("");
 }
 function drawOverview() {
   const s = view.stats;
@@ -188,6 +220,7 @@ function drawPackets(data) {
   $("next").disabled = data.page+1 >= data.pages;
 }
 function drawReport() {
+  drawAnnotations();
   $("reportScope").textContent = active + " · " + fmt(view.matched) + " of " + fmt(view.capture.total) +
     " frames · " + (expression || "All frames");
   $("reportFindings").innerHTML = findings(true);
@@ -195,15 +228,32 @@ function drawReport() {
     view.events.map(e => '<tr><td><button class="ref" data-frame="' + esc(e.frame) + '">#' + esc(e.frame) +
     '</button></td><td>' + esc(e.time) + '</td><td>' + esc(e.src) + ' → ' + esc(e.dst) + '</td><td>' +
     esc(e.observation) + '</td></tr>').join("") + '</tbody></table></div>' : '<p>No matching events.</p>';
-  $("reportAi").textContent = view.ai ? "The export includes the AI review for this filter." : "The export uses locally decoded evidence.";
+  const approved = view.ai?.approved?.length || 0;
+  $("reportAi").textContent = approved ? "Approved AI observations included in this export: " + approved :
+    "Only local evidence and analyst findings are included. No AI observations approved for this filter.";
 }
 function drawAI() {
   const ai = view.ai;
-  $("sendReview").disabled = view.matched === 0;
+  $("prepareAI").disabled = view.matched === 0;
+  $("sendReview").disabled = view.matched === 0 || !$("preview").dataset.fingerprint;
   $("aiResult").hidden = !ai;
   $("aiResult").innerHTML = ai ? '<h2>Provider review</h2><small>' + esc(ai.provider_label || ai.provider) + ' · ' + esc(ai.model) +
     ' · ' + ai.included + ' frames supplied' + (ai.complete ? '' : ' · Partial response') +
-    '</small><p>' + esc(ai.text) + '</p>' : "";
+    '</small><p>Verify the interpretation against the cited packets before approving it for export.</p>' +
+    ((ai.observations || []).map((obs,i) => '<label class="ai-observation"><input type="checkbox" data-approve="' + i +
+      '" ' + ((ai.approved || []).includes(i) ? "checked " : "") + (obs.valid ? "" : "disabled") + '> ' +
+      esc(obs.text) + '</label><p class="muted">' + (obs.valid ? "Supplied frames: " : "Unverified citations · frames: ") +
+      esc(obs.frames.join(", ") || "none") + '</p>').join("") ||
+      '<p>The response supplied no observations in the required citation format. It is available below for inspection.</p>') +
+    ((ai.observations || []).some(o=>o.valid) ? '<button id="saveAIApproval" class="secondary">Save approved observations</button>' : '') +
+    '<details><summary>Original provider response</summary><pre>' + esc(ai.text) + '</pre></details>' : "";
+  const save = $("saveAIApproval");
+  if (save) save.onclick = () => task("Saving approved observations…", async () => {
+    const approved = Array.from($("aiResult").querySelectorAll("[data-approve]:checked"), input=>Number(input.dataset.approve));
+    view.ai = await request("review-approval",scope({review_id:ai.id,approved}));
+    drawAI();
+    drawReport();
+  });
 }
 function openImport() {
   if (importing) return;
@@ -245,7 +295,7 @@ function uploadCapture(file, params) {
     xhr.responseType = "json";
     const progress = loaded => {
       const pct = Math.floor(100 * loaded / file.size);
-      importStatus("Uploading " + file.name, size(loaded) + " of " + size(file.size) + " · " + pct + "%", pct);
+      importStatus("Uploading " + file.name, size(loaded) + " of " + size(file.size) + " · " + pct + "%", pct, "Cancel upload", () => xhr.abort());
     };
     progress(0);
     xhr.upload.onprogress = e => progress(e.loaded);
@@ -262,7 +312,9 @@ function uploadCapture(file, params) {
 
 async function watchImport(job) {
   while (job.state === "indexing") {
-    importStatus("Indexing " + job.name, fmt(job.frames || 0) + " frames indexed", undefined);
+    const progress = [fmt(job.frames || 0) + " frames indexed", storageSummary(job.storage)].filter(Boolean).join(" · ");
+    importStatus("Indexing " + job.name, progress, undefined, "Cancel indexing",
+      () => request("cancel",{job:job.job}).catch(err => notice(err.message)));
     await new Promise(resolve => setTimeout(resolve,1000));
     try {
       job = await request("import-status",{job:job.job});
@@ -311,6 +363,7 @@ function pick(file) {
 function showEmpty() {
   active = "";
   view = null;
+  annotationOwner = "";
   $("work").hidden = true;
   $("empty").hidden = false;
   $("fileInfo").hidden = true;
@@ -330,7 +383,9 @@ function evidenceDetails() {
   $("detailTitle").textContent = "Evidence details";
   $("detailError").textContent = "";
   $("detail").innerHTML = '<dl>' + facts.map(([k,v]) => '<dt>' + k + '</dt><dd>' + esc(v) + '</dd>').join("") +
-    '</dl><p class="muted">Closing this capture clears its session review. Your original file stays on disk.</p><div class="evidence-actions"><button class="secondary" id="closeCapture">Close capture</button></div>';
+    '</dl><h3>Acquisition history</h3><div class="tablewrap"><table><thead><tr><th>Filename</th><th>Source</th><th>Acquired</th><th>Imported (UTC)</th></tr></thead><tbody>' +
+    c.acquisitions.map(item => '<tr>' + [item.name,item.source || "Local import",item.acquired || "Unspecified",item.imported_at].map(value => '<td>' + esc(value) + '</td>').join("") + '</tr>').join("") +
+    '</tbody></table></div><p class="muted">Save a case before closing to keep notes and reviews.</p><div class="evidence-actions"><button class="secondary" id="closeCapture">Close capture</button></div>';
   $("detailDialog").showModal();
 }
 async function exportReport(format) {
@@ -359,7 +414,8 @@ document.addEventListener("click", e => {
       ["Capture length",fmt(data.captured) + " bytes captured / " + fmt(data.wire) + " bytes on wire"]];
     $("detail").innerHTML = '<dl class="frame-facts">' + facts.map(([label,value]) =>
       '<dt>' + label + '</dt><dd>' + esc(value) + '</dd>').join("") +
-      '</dl><details open><summary>Decoded headers and fields</summary><pre id="frameHeaders"></pre></details>' +
+      '</dl><button class="secondary" data-pin="' + esc(b.dataset.frame) + '">Pin frame to report</button>' +
+      '<details open><summary>Decoded headers and fields</summary><pre id="frameHeaders"></pre></details>' +
       '<details open><summary>Decoded payload</summary><p class="muted" id="payloadInfo"></p><pre class="hex" id="payloadBytes"></pre></details>' +
       '<details><summary>Captured bytes · hex and ASCII</summary><pre class="hex" id="frameBytes"></pre></details>';
     $("frameHeaders").textContent = data.detail || "No protocol fields were decoded.";
@@ -452,21 +508,37 @@ $("provider").onchange = () => {
   $("apiEndpoint").required = custom;
   $("model").value = $("provider").selectedOptions[0]?.dataset.model || "";
   $("key").value = "";
+  clearReviewPreview();
 };
-$("apiEndpoint").oninput = $("apiAuth").onchange = $("apiProtocol").onchange = () => { $("key").value = ""; };
-$("excerpt").ontoggle = () => {
-  if ($("excerpt").open && !$("preview").textContent) task("Preparing evidence preview…",async () => {
-    $("preview").textContent = JSON.stringify(await request("preview",scope()),null,2);
-  });
-};
+function clearReviewPreview() {
+  delete $("preview").dataset.fingerprint;
+  $("preview").textContent = "";
+  $("excerpt").hidden = true;
+  $("sendReview").disabled = true;
+}
+function reviewSettings() {
+  const provider = $("provider").value;
+  const custom = provider === "custom" ? {endpoint:$("apiEndpoint").value.trim(), protocol:$("apiProtocol").value, auth:$("apiAuth").value} : {};
+  return scope({provider, model:$("model").value.trim(), redact:$("redactAI").checked, ...custom});
+}
+$("apiEndpoint").oninput = $("apiAuth").onchange = $("apiProtocol").onchange = () => { $("key").value = ""; clearReviewPreview(); };
+$("model").oninput = $("redactAI").onchange = clearReviewPreview;
+$("prepareAI").onclick = () => task("Preparing outgoing request…",async () => {
+  clearReviewPreview();
+  const preview = await request("preview",reviewSettings());
+  const headers = {...preview.headers,[preview.credential_header]:"[API key, omitted]"};
+  $("preview").textContent = JSON.stringify({url:preview.url,headers,body:preview.body},null,2);
+  $("preview").dataset.fingerprint = preview.fingerprint;
+  $("excerpt").hidden = false;
+  $("excerpt").open = true;
+  drawAI();
+});
 $("aiForm").onsubmit = e => {
   e.preventDefault();
   task("Waiting for provider review…",async () => {
     const key = $("key").value.trim();
     $("key").value = "";
-    const provider = $("provider").value;
-    const custom = provider === "custom" ? {endpoint:$("apiEndpoint").value.trim(), protocol:$("apiProtocol").value, auth:$("apiAuth").value} : {};
-    view.ai = await request("review",scope({provider, model:$("model").value.trim(), key, ...custom}));
+    view.ai = await request("review",{...reviewSettings(), key, fingerprint:$("preview").dataset.fingerprint});
     drawAI();
     drawReport();
   });

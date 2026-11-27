@@ -3,7 +3,9 @@
 <head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
   <title>HENIX · Network investigation</title>
+  <script src="/analyst.js" defer></script>
   <link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script>
+  <script src="/cases.js" defer></script>
 </head>
 <body>
 <aside class="rail">
@@ -26,7 +28,7 @@
     <div class="import-info"><strong id="importStage"></strong><span id="importStatus" role="status"></span><progress id="importMeter" aria-label="Capture import progress"></progress></div>
     <button id="importAction" type="button" class="secondary" hidden></button>
   </section>
-  <section class="pagehead"><div><h1 id="title">Capture overview</h1><div id="identity"></div></div><button id="fileInfo" class="secondary" hidden>Evidence details</button></section>
+  <section class="pagehead"><div><h1 id="title">Capture overview</h1><div id="identity"></div></div><div class="evidence-actions"><button id="fileInfo" class="secondary" hidden>Evidence details</button> <button id="caseFiles" class="secondary">Case files</button></div></section>
   <section id="empty" class="panel empty"><div class="empty-icon" aria-hidden="true">↑</div><h2>Open a capture to investigate</h2><p>Drop a .cap, .pcap or .pcapng file here to inspect its traffic locally.</p><button id="emptyImport" class="primary">Choose capture</button><p class="import-limits">Up to 5 GiB per file</p></section>
   <div id="work" hidden>
     <form id="filterForm" class="filterbar"><label for="filter">Display filter</label><input id="filter" spellcheck="false" autocomplete="off" maxlength="2048" placeholder="e.g. tcp.stream == 0"><button type="submit" class="dark">Apply</button><button type="button" id="clear" class="secondary">Clear</button></form>
@@ -39,7 +41,9 @@
         <article class="panel"><div class="panelhead"><div><h2>Detected protocols</h2><p id="protocolCount"></p></div></div><div id="protocols"></div><details><summary>Protocol hierarchy</summary><pre id="hierarchy"></pre></details></article>
       </div>
       <article class="panel"><div class="panelhead"><div><h2>Investigation findings</h2><p>Selected exchanges with packet references</p></div><button class="textbtn" id="goReport">View report →</button></div><div id="findings"></div></article>
-      <article class="panel"><div class="panelhead"><div><h2>TCP conversations</h2><p id="streamCount"></p></div></div><div id="streams"></div></article>
+      <article class="panel"><div class="panelhead"><div><h2>TCP conversations</h2><p id="streamCount"></p></div></div>
+      <form class="filterbar" id="conversationSearch"><label for="conversationQuery">Find streams</label><input id="conversationQuery" maxlength="200" placeholder="Stream ID, address or port"><button type="submit" class="secondary">Search all streams</button></form>
+      <div id="streams"></div><div id="conversationPager" class="pager" hidden><button type="button" id="conversationPrev" class="secondary">Previous</button><span id="conversationPage"></span><button type="button" id="conversationNext" class="secondary">Next</button></div></article>
     </section>
     <section id="packets" class="view" hidden>
       <article class="panel"><div class="panelhead"><div><h2>Matching packets</h2><p id="packetCount"></p></div></div>
@@ -55,14 +59,20 @@
         <label>API key header<select id="apiAuth"><option value="auto">Default for API format</option><option value="bearer">Authorization: Bearer</option><option>api-key</option><option>x-api-key</option><option>x-goog-api-key</option></select></label></div>
         <p class="muted">Your key and evidence excerpt go to this URL. For generateContent, include {model} in the endpoint path.</p></div>
       <div class="formgrid"><label>API key<input type="password" id="key" autocomplete="off" required></label></div>
-      <details id="excerpt"><summary>Evidence sent to the provider</summary><pre id="preview"></pre></details>
-      <p class="muted">Includes up to 40 matching frames with timestamps, endpoints and selected protocol fields. Your key is used for this request only.</p>
+      <label><input type="checkbox" id="redactAI" checked> Redact endpoint identities, names and filter text</label>
+      <p class="muted">The excerpt includes up to 40 frames. Redaction retains frame numbers, UTC timestamps, protocol labels and selected numeric fields.</p>
+      <button type="button" class="secondary" id="prepareAI">Preview outgoing request</button>
+      <details id="excerpt" hidden><summary>Destination, headers and request body</summary><pre id="preview"></pre></details>
       <button class="primary" id="sendReview">Send excerpt for review</button></form></article>
       <article class="panel" id="aiResult" hidden></article>
     </section>
     <section id="report" class="view" hidden>
       <article class="panel reportcard"><div><h2>Investigation report</h2><p>Export a print-ready report or a casefile with the evidence manifest, timeline and display filters.</p></div>
         <div class="actions"><button id="exportHTML" class="primary">Download HTML</button><button id="exportZip" class="secondary">Export casefile .zip</button></div></article>
+      <article class="panel"><h2>Analyst assessment</h2><form id="conclusionForm"><label for="conclusion">Conclusion for this capture</label>
+        <textarea id="conclusion" maxlength="3000" rows="3"></textarea><button class="secondary" type="submit">Save conclusion</button></form>
+        <h3 class="subhead">Pinned evidence</h3><p class="muted">Pins belong to this capture and appear in its exports across display filters.</p>
+        <button id="addFramePin" type="button" class="secondary">Pin frame numbers</button><div id="pins"></div></article>
       <article class="panel"><div class="panelhead"><div><h2>Report evidence</h2><p id="reportScope"></p></div></div><div id="reportFindings"></div>
       <h3 class="subhead">Observed flow</h3><div id="reportTimeline"></div><p id="reportAi" class="muted"></p></article>
     </section>
@@ -76,5 +86,18 @@
   <p class="muted">HENIX stores a working copy and packet index on the local workspace drive. Keep the server running while it indexes the capture.</p>
   <p id="importError" class="error" role="alert"></p><button class="primary" type="submit">Open capture</button></form></dialog>
 <dialog id="detailDialog" aria-labelledby="detailTitle"><div class="dialoghead"><h2 id="detailTitle">Frame details</h2><button class="dismiss" aria-label="Close">×</button></div><div id="detail"></div><p id="detailError" class="error" role="alert"></p></dialog>
-<div id="busy" role="status" hidden></div>
+<dialog id="pinDialog" aria-labelledby="pinTitle"><form id="pinForm"><div class="dialoghead"><h2 id="pinTitle">Pin evidence to report</h2><button class="dismiss" type="button" aria-label="Close">×</button></div>
+<p id="pinRefs" class="muted"></p>
+<div id="customPin" hidden><label for="pinNumbers">Frame numbers</label><input id="pinNumbers" type="text" maxlength="448" autocomplete="off" aria-describedby="pinHint" disabled required>
+<p id="pinHint" class="muted">Enter up to 32 frame numbers from this capture, separated by spaces or commas.</p></div>
+<label for="pinNote">Analyst note</label><textarea id="pinNote" rows="4" maxlength="2000"></textarea>
+<p id="pinError" class="error" role="alert"></p><button class="primary" type="submit">Save pin</button></form></dialog>
+<div id="busy" hidden><span id="busyMessage" role="status"></span> <span id="busyStorage"></span> <button type="button" class="secondary" id="cancelOperation" hidden>Cancel</button></div>
+<dialog id="caseDialog" aria-labelledby="caseTitle"><div class="dialoghead"><h2 id="caseTitle">Case files</h2><button type="button" class="dismiss" aria-label="Close">×</button></div>
+<section id="caseSaveSection"><h3>Save current case</h3><p class="muted">The download includes the original capture, packet index, acquisition history, display filter, notes and AI reviews.</p>
+<button type="button" id="saveCase" class="secondary">Download .henix case</button></section>
+<section><h3>Open saved case</h3><label>Case file <input id="caseInput" type="file" accept=".henix"></label>
+<label><input type="checkbox" id="caseRebuild"> Rebuild index from the original capture</label>
+<p class="muted">Reuse the index for cases from a trusted source. Select Rebuild index to independently decode the captured packets.</p>
+<button type="button" id="openCase" class="primary">Open case</button></section><p id="caseMessage" role="status"></p></dialog>
 </body></html>

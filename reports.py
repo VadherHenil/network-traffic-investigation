@@ -7,9 +7,11 @@ import zipfile
 from html import escape
 from datetime import datetime, timezone
 
-from capture import address, port, version
+from analyst import annotations
+from capture import address, endpoint, port, utc, version
 from findings import investigate
 from large_metrics import layer_inventory
+from providers import approved_review
 
 
 INVALID_TEXT = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]")
@@ -22,7 +24,7 @@ def h(value):
 def flow_diagram(ref, events):
     """Sequence diagram for the first four hosts in the cited timeline."""
     endpoints = list(dict.fromkeys(ep for e in events for ep in (e["src_host"], e["dst_host"])))[:4]
-    shown = [e for e in events if e["src_host"] in endpoints and e["dst_host"] in endpoints]
+    shown = [e for e in events if e["src_host"] in endpoints and e["dst_host"] in endpoints][:100]
     width, height = max(500, len(endpoints) * 225), 90 + len(shown) * 36
     pos = {ep: 110 + i * 225 for i, ep in enumerate(endpoints)}
     parts = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" role="img" '
@@ -45,8 +47,40 @@ def flow_diagram(ref, events):
     return "".join(parts) + "</svg>"
 
 
+def acquisition_history(capture):
+    return getattr(capture, "acquisitions", [{"name": capture.name, "source": capture.source,
+                                             "acquired": capture.acquired, "imported_at": ""}])
+
+
+def report_events(capture, auto_events, pins):
+    """Preserve selected evidence across filters; label analyst and decoder observations."""
+    by_frame = {e["frame"]: {**e, "origin": "Decoder"} for e in auto_events}
+    notes = {}
+    for pin in pins:
+        for number in pin["frames"]:
+            notes.setdefault(number, []).append(pin["note"])
+    numbers = sorted(set(by_frame) | set(notes), key=int)
+    for i in range(0, len(numbers), 500):
+        chunk = numbers[i:i+500]
+        marks = ",".join("?" for _ in chunk)
+        for row in capture.rows.search(f'"frame.number" IN ({marks})', tuple(chunk)):
+            number = row["frame.number"]
+            event = by_frame.setdefault(number, dict(frame=number, time=utc(row.get("frame.time_epoch")),
+                src=endpoint(row, "src"), dst=endpoint(row, "dst"), src_host=address(row,"src"),
+                dst_host=address(row,"dst"), observation="", origin="Analyst pin"))
+            event.update(src_port=port(row,"src"), dst_port=port(row,"dst"))
+            if number in notes:
+                if event["origin"] == "Decoder":
+                    event["origin"] = "Decoder and analyst pin"
+                messages = [note for note in notes[number] if note]
+                event["observation"] = "\n".join(filter(None, [event["observation"], *messages])) or "Pinned frame"
+    return sorted(by_frame.values(), key=lambda e: (e["time"], int(e["frame"])))
+
+
 def build_report(capture, rows, expression, ai=None):
+    ai = approved_review(ai)
     findings, events = investigate(rows)
+    state = annotations(capture)
     ref = capture.id
     window = " to ".join(capture.window) or "Empty capture"
     scope = " to ".join(capture.time_window(rows)) or "No matching timestamps"
@@ -63,9 +97,24 @@ def build_report(capture, rows, expression, ai=None):
         refs = ", ".join(f"{ref} #{n}" for n in f["frames"])
         sections.append(f"<article><h3>{h(f['title'])}</h3><p>{h(f['observation'])}</p>"
                         f"<p>{h(f['meaning'])}</p><small>{h(refs)}</small></article>")
+    pinned = []
+    for pin in state["pins"]:
+        refs = ", ".join(f"{ref} #{n}" for n in pin["frames"])
+        pinned.append(f"<article><p class='ai'>{h(pin['note']) or 'Pinned evidence'}</p><small>{h(refs)}</small></article>")
+    analyst_section = ""
+    if state["conclusion"] or pinned:
+        analyst_section = "<h2>Analyst assessment</h2>"
+        if state["conclusion"]:
+            analyst_section += f"<h3>Conclusion</h3><p class='ai'>{h(state['conclusion'])}</p>"
+        if pinned:
+            analyst_section += ("<h3>Pinned evidence</h3><p>Analyst-selected references span the capture and can "
+                                "fall outside the report display filter.</p>" + "".join(pinned))
+    events = report_events(capture, events, state["pins"])
     timeline = "".join(f"<tr><td>{h(ref)} #{h(e['frame'])}</td><td>{h(e['time'])}</td>"
-                       f"<td>{h(e['src'])}<br>→ {h(e['dst'])}</td><td>{h(e['observation'])}</td></tr>"
+                       f"<td>{h(e['src'])}<br>→ {h(e['dst'])}</td><td>{h(e['origin'])}</td><td class='ai'>{h(e['observation'])}</td></tr>"
                        for e in events)
+    acquisition_table = "".join("<tr>" + "".join(f"<td>{h(a.get(key) or '—')}</td>" for key in
+        ("name","source","acquired","imported_at")) + "</tr>" for a in acquisition_history(capture))
     facts = {"Evidence ID": ref, "Original file": capture.name, "SHA-256": capture.digest,
              "Source": capture.source or "Local import · source unspecified",
              "Acquisition date": capture.acquired or "Unspecified", "Decoder": version(),
@@ -100,9 +149,11 @@ th{{background:#eff4ef}}.ai{{white-space:pre-wrap}}main{{overflow-wrap:anywhere}
 <main><header><b>HENIX</b><span>Network investigation</span></header><h1>Investigation report</h1>
 <p>{h(capture.name)} · {h(ref)}</p><h2>Decision and scope</h2><p>{h(decision)}</p>
 <p>This review covers {len(rows):,} of {len(capture.rows):,} frames and highlights selected exchanges.
-Capture boundaries and the display filter limit the conclusions.</p><dl>{meta}</dl><h2>Packet findings</h2>
+Capture boundaries and the display filter limit the automated conclusions.</p><dl>{meta}</dl>
+<h2>Acquisition history</h2><table><thead><tr><th>Filename</th><th>Source</th><th>Acquired</th>
+<th>Imported (UTC)</th></tr></thead><tbody>{acquisition_table}</tbody></table>{analyst_section}<h2>Packet findings</h2>
 {''.join(sections) or '<p>No observations are available for this scope.</p>'}
-<h2>Observed flow</h2>{flow_diagram(ref, events) if events else ''}<table><thead><tr><th>Reference</th><th>Time (UTC)</th><th>Direction</th><th>Observation</th></tr></thead>
+<h2>Observed flow</h2>{flow_diagram(ref, events) if events else ''}<table><thead><tr><th>Reference</th><th>Time (UTC)</th><th>Direction</th><th>Origin</th><th>Observation</th></tr></thead>
 <tbody>{timeline}</tbody></table><h2>Alternative explanation</h2><p>{h(alternative)}</p>
 <h2>Recommended next step</h2><p>{h(next_step)}</p>{review}
 <h2>Decoded protocol layers</h2><p>Each count is the number of matching frames containing the layer.
@@ -129,9 +180,8 @@ def bundle(capture, rows, expression, ai):
     html, events = build_report(capture, rows, expression, ai)
     timeline = []
     for event in events:
-        row = capture.by_number[event["frame"]]
-        timeline.append([capture.id, event["frame"], event["time"], address(row, "src"), port(row, "src"),
-                         address(row, "dst"), port(row, "dst"), event["observation"]])
+        timeline.append([capture.id, event["frame"], event["time"], event["src_host"], event["src_port"],
+                         event["dst_host"], event["dst_port"], event["observation"], event["origin"]])
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("report/investigation.html", html)
@@ -139,11 +189,12 @@ def bundle(capture, rows, expression, ai):
             archive.writestr("diagrams/observed-flow.svg", flow_diagram(capture.id, events))
         archive.writestr("evidence/manifest.csv", csv_data(
             ["Evidence ID", "Filename", "Source", "Acquisition date", "SHA-256", "Decoder", "Index dissection passes",
-             "Capture start UTC", "Capture end UTC"],
-            [[capture.id, capture.name, capture.source, capture.acquired, capture.digest, version(),
-              capture.dissection_passes, *(capture.window or ["", ""])]]))
+             "Capture start UTC", "Capture end UTC", "Imported UTC"],
+            [[capture.id, a["name"], a["source"], a["acquired"], capture.digest, version(),
+              capture.dissection_passes, *(capture.window or ["", ""]), a["imported_at"]]
+             for a in acquisition_history(capture)]))
         archive.writestr("evidence/timeline.csv", csv_data(
-            ["Evidence ID", "Frame", "Time (UTC)", "Source address", "Source port", "Destination address", "Destination port", "Observation"],
+            ["Evidence ID", "Frame", "Time (UTC)", "Source address", "Source port", "Destination address", "Destination port", "Observation", "Origin"],
             timeline))
         archive.writestr("analysis/display-filters.txt", "Scope\n" + (expression or "(all frames)") +
                          "\n\nCited frames\n" + "\n".join("frame.number == " + e["frame"] for e in events))

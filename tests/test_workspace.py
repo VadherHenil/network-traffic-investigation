@@ -26,6 +26,7 @@ class InvestigationTests(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        cls.ws.shutdown()
         cls.folder.cleanup()
 
     def test_training_bytes_and_filters(self):

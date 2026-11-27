@@ -1,0 +1,80 @@
+name: Verify and release HENIX
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*.*.*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      full_capacity:
+        description: Run the 5 GiB capacity check
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      TSHARK_PATH: C:\Program Files\Wireshark\tshark.exe
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install test tools
+        shell: pwsh
+        run: |
+          if (!(Test-Path -LiteralPath $env:TSHARK_PATH)) {
+            choco install wireshark -y --no-progress
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          & $env:TSHARK_PATH --version
+          python -m pip install psutil==7.2.2
+      - run: npm install --no-save --package-lock=false playwright@1.62.1
+      - run: npx playwright install chromium
+      - run: python -m unittest discover -s tests -v
+      - run: python -m tests.browser_check
+      - name: Benchmark short UDP packets
+        run: python -m tests.large_capture_check --gib 0.04 --record-size 96 --metrics measurements/short-packets.json
+      - name: Benchmark large UDP packets
+        run: python -m tests.large_capture_check --gib 0.08 --record-size 8192 --metrics measurements/large-packets.json
+      - name: Verify full capacity for releases and requested runs
+        if: startsWith(github.ref, 'refs/tags/') || inputs.full_capacity
+        run: python -m tests.large_capture_check --gib 5 --record-size 8192 --metrics measurements/full-capacity.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: capacity-measurements
+          path: measurements/*.json
+          if-no-files-found: error
+
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: capacity-measurements
+          path: measurements
+      - name: Publish verified release and capacity measurements
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          gh release create "$TAG" measurements/*.json --verify-tag --latest --title "HENIX $TAG" --notes-file "docs/releases/$TAG.md"
